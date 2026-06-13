@@ -17,8 +17,8 @@
   "dependencies": {
     "@types/fs-extra": "^9.0.11",
     "aws4": "^1.13.2",
-    "builder-util": "workspace:*",
-    "builder-util-runtime": "workspace:*",
+    "builder-util": "26.15.3",
+    "builder-util-runtime": "26.15.3",
     "chalk": "^4.1.2",
     "form-data": "^4.0.5",
     "fs-extra": "^10.1.0",

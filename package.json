@@ -1,6 +1,6 @@
 {
   "name": "@electron-builder/monorepo",
-  "private": true,
+  "private": false,
   "license": "MIT",
   "scripts": {
     "//": "do not wrap into single quotes - windows doesn't unwrap arg in this case",
