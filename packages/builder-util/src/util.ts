@@ -1,0 +1,554 @@
+import { Nullish, safeStringifyJson, isValidKey, isSensitiveFieldName, hashSensitiveValue } from "builder-util-runtime"
+import * as chalk from "chalk"
+import { ChildProcess, execFile, ExecFileOptions, SpawnOptions } from "child_process"
+import { spawn as _spawn } from "cross-spawn"
+import _debug from "debug"
+import { dump } from "js-yaml"
+import * as path from "path"
+import { install as installSourceMap } from "source-map-support"
+import { debug, log } from "./log"
+import { exists } from "./fs"
+import { mkdir } from "fs-extra"
+import { isEmptyOrSpaces } from "./stringUtil"
+
+if (process.env.JEST_WORKER_ID == null) {
+  installSourceMap()
+}
+
+export { isEmptyOrSpaces } from "./stringUtil"
+export { safeStringifyJson, retry } from "builder-util-runtime"
+export { TmpDir } from "temp-file"
+export * from "./arch"
+export { Arch, archFromString, ArchType, defaultArchFromString, getArchCliNames, getArchSuffix, toLinuxArchString } from "./arch"
+export { AsyncTaskManager } from "./asyncTaskManager"
+export { DebugLogger } from "./DebugLogger"
+export * from "./log"
+export { buildGotProxyAgent, httpExecutor, NodeHttpExecutor } from "./nodeHttpExecutor"
+export * from "./promise"
+export * from "./envUtil"
+export { parseValidEnvVarUrl } from "./envUtil"
+
+export { asArray, deepAssign, isValidKey } from "builder-util-runtime"
+export * from "./fs"
+
+export { generateKsuid } from "./ksuid"
+export { loadCscLink, decodeCscLinkBase64, resolveCscLinkPath } from "./cscLink"
+
+export const debug7z = _debug("electron-builder:7z")
+
+export function serializeToYaml(object: any, skipInvalid = false, noRefs = false) {
+  return dump(object, {
+    lineWidth: 8000,
+    skipInvalid,
+    noRefs,
+  })
+}
+
+export function removePassword(input: string): string {
+  // Sensitive parameter stems — any of `-`, `--`, or `/` prefix is accepted for all stems.
+  // `pass:` is intentionally absent; the dedicated pass: handler below covers it without double-processing.
+  const sensitiveStems = ["accessKey", "secretKey", "privateToken", "apiKey", "passphrase", "password", "secret", "token", "String", "pass", "p"]
+  const stemAlt = sensitiveStems.map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")
+  // (?:--?|/) matches -, --, or / prefix. Longest stems listed first to minimise backtracking.
+  // (?<!\S) / (?=[\s"']|$) word-boundary guards prevent matching -path, -StringLength, etc.
+  const flagPattern = new RegExp(`(?<!\\S)((?:--?|/)(?:${stemAlt}))(?=[\\s"']|$)\\s*(?:(["'])(.*?)\\2|([^\\s]+))`, "gi")
+
+  input = input.replace(flagPattern, (_match, prefix, quote, quotedVal, unquotedVal) => {
+    const value = quotedVal ?? unquotedVal
+
+    if (prefix.trim().toLowerCase() === "/p" && value.startsWith("\\\\Mac\\Host\\")) {
+      return `${prefix} ${quote ?? ""}${value}${quote ?? ""}`
+    }
+
+    return `${prefix} ${quote ?? ""}${hashSensitiveValue(value)}${quote ?? ""}`
+  })
+
+  // pass:value — colon acts as separator; handles both pass:secret (no space) and pass: secret (space)
+  // Quoted phrases (pass:'a b c' or pass:"a b c") are captured in full so the whole phrase is hashed.
+  input = input.replace(/(?<!\S)pass:\s*(?:(["'])(.*?)\1|([^\s]+))/gi, (_match, quote, quotedVal, unquotedVal) => {
+    const value = quotedVal ?? unquotedVal
+    return quote ? `pass:${quote}${hashSensitiveValue(value)}${quote}` : `pass:${hashSensitiveValue(value)}`
+  })
+
+  // /b … /c block format
+  return input.replace(/(\/b\s+)(.*?)(\s+\/c)/g, (_match, p1, p2, p3) => {
+    return `${p1}${hashSensitiveValue(p2)}${p3}`
+  })
+}
+
+const SENSITIVE_ENV_KEY_RE = /KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|CSC/i
+
+/**
+ * Returns a copy of the environment with sensitive keys removed.
+ * Use this when building the environment for child processes that do not
+ * need signing credentials, tokens, or passwords (e.g. package managers).
+ */
+export function stripSensitiveEnvVars(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {}
+  for (const [k, v] of Object.entries(env)) {
+    if (isValidKey(k) && !isSensitiveFieldName(k) && !SENSITIVE_ENV_KEY_RE.test(k)) {
+      out[k] = v
+    }
+  }
+  return out
+}
+
+export function filterSensitiveEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {}
+  for (const [k, v] of Object.entries(env)) {
+    out[k] = (isSensitiveFieldName(k) || SENSITIVE_ENV_KEY_RE.test(k)) && v != null ? hashSensitiveValue(v) : v
+  }
+  return out
+}
+
+function getProcessEnv(env: Record<string, string | undefined> | Nullish): NodeJS.ProcessEnv | undefined {
+  // Windows: passing a filtered env to execFile drops critical system vars (PATH, SYSTEMROOT, TEMP)
+  // that many tools require. Credential stripping is therefore not applied on Windows.
+  if (process.platform === "win32") {
+    return env == null ? undefined : env
+  }
+
+  // When no explicit env is provided, strip credential env vars so child processes
+  // (package managers, signing tools, etc.) don't inherit secrets they don't need.
+  const finalEnv = {
+    ...(env == null ? stripSensitiveEnvVars(process.env) : env),
+  }
+
+  // without LC_CTYPE dpkg can returns encoded unicode symbols
+  // set LC_CTYPE to avoid crash https://github.com/electron-userland/electron-builder/issues/503 Even "en_DE.UTF-8" leads to error.
+  const locale = process.platform === "linux" ? process.env.LANG || "C.UTF-8" : "en_US.UTF-8"
+  finalEnv.LANG = locale
+  finalEnv.LC_CTYPE = locale
+  finalEnv.LC_ALL = locale
+  return finalEnv
+}
+
+export function exec(file: string, args?: Array<string> | null, options?: ExecFileOptions, isLogOutIfDebug = true): Promise<string> {
+  if (log.isDebugEnabled) {
+    const logFields: any = {
+      file,
+      args: args == null ? "" : removePassword(args.join(" ")),
+    }
+    if (options != null) {
+      if (options.cwd != null) {
+        logFields.cwd = options.cwd
+      }
+
+      if (options.env != null) {
+        const diffEnv = { ...options.env }
+        for (const name of Object.keys(process.env)) {
+          if (process.env[name] === options.env[name]) {
+            delete diffEnv[name]
+          }
+        }
+        logFields.env = safeStringifyJson(filterSensitiveEnv(diffEnv))
+      }
+    }
+
+    log.debug(logFields, "executing")
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    execFile(
+      file,
+      args,
+      {
+        ...options,
+        maxBuffer: 1000 * 1024 * 1024,
+        env: getProcessEnv(options == null ? null : options.env), // codeql[js/shell-command-injection-from-environment] - env filtered via getProcessEnv/stripSensitiveEnvVars; execFile array args (no shell)
+      },
+      (error, stdout, stderr) => {
+        if (error == null) {
+          if (isLogOutIfDebug && log.isDebugEnabled) {
+            const logFields: any = {
+              file,
+            }
+            if (stdout.length > 0) {
+              logFields.stdout = stdout
+            }
+            if (stderr.length > 0) {
+              logFields.stderr = stderr
+            }
+
+            log.debug(logFields, "executed")
+          }
+          resolve(stdout.toString())
+        } else {
+          let message = chalk.red(removePassword(`Exit code: ${(error as any).code}. ${error.message}`))
+          if (stdout.length !== 0) {
+            if (file.endsWith("wine")) {
+              stdout = stdout.toString()
+            }
+            message += `\n${chalk.yellow(removePassword(stdout.toString()))}`
+          }
+          if (stderr.length !== 0) {
+            if (file.endsWith("wine")) {
+              stderr = stderr.toString()
+            }
+            message += `\n${chalk.red(removePassword(stderr.toString()))}`
+          }
+
+          // TODO: switch to ECMA Script 2026 Error class with `cause` property to return stack trace
+          reject(new ExecError(file, (error as any).code, message, "", `${error.code || ExecError.code}`))
+        }
+      }
+    )
+  })
+}
+
+export interface ExtraSpawnOptions {
+  isPipeInput?: boolean
+}
+
+function logSpawn(command: string, args: Array<string>, options: SpawnOptions) {
+  // use general debug.enabled to log spawn, because it doesn't produce a lot of output (the only line), but important in any case
+  if (!log.isDebugEnabled) {
+    return
+  }
+
+  const argsString = removePassword(args.join(" "))
+  const logFields: any = {
+    command: command + " " + (command === "docker" ? argsString : removePassword(argsString)),
+  }
+  if (options != null && options.cwd != null) {
+    logFields.cwd = options.cwd
+  }
+  log.debug(logFields, "spawning")
+}
+
+export function doSpawn(command: string, args: Array<string>, options?: SpawnOptions, extraOptions?: ExtraSpawnOptions): ChildProcess {
+  if (options == null) {
+    options = {}
+  }
+
+  options.env = getProcessEnv(options.env)
+
+  if (options.stdio == null) {
+    const isDebugEnabled = debug.enabled
+    // do not ignore stdout/stderr if not debug, because in this case we will read into buffer and print on error
+    options.stdio = [extraOptions != null && extraOptions.isPipeInput ? "pipe" : "ignore", isDebugEnabled ? "inherit" : "pipe", isDebugEnabled ? "inherit" : "pipe"] as any
+  }
+
+  logSpawn(command, args, options)
+  try {
+    return _spawn(command, args, options)
+  } catch (e: any) {
+    throw new Error(`Cannot spawn ${command}: ${e.stack || e}`)
+  }
+}
+
+export function spawnAndWrite(command: string, args: Array<string>, data: string, options?: SpawnOptions) {
+  const childProcess = doSpawn(command, args, options, { isPipeInput: true })
+  const timeout = setTimeout(() => childProcess.kill(), 4 * 60 * 1000)
+  return new Promise<any>((resolve, reject) => {
+    handleProcess(
+      "close",
+      childProcess,
+      command,
+      () => {
+        try {
+          clearTimeout(timeout)
+        } finally {
+          resolve(undefined)
+        }
+      },
+      error => {
+        try {
+          clearTimeout(timeout)
+        } finally {
+          reject(error)
+        }
+      }
+    )
+
+    childProcess.stdin!.end(data)
+  })
+}
+
+export function spawnAndWriteWithOutput(command: string, args: Array<string>, data: string, options?: SpawnOptions): Promise<{ stdout: string; stderr: string }> {
+  const childProcess = doSpawn(command, args, { ...options, stdio: ["pipe", "pipe", "pipe"] as any })
+  const isDebugEnabled = debug.enabled
+
+  return new Promise((resolve, reject) => {
+    let stdout = ""
+    let stderr = ""
+    let timedOut = false
+
+    const timeout = setTimeout(
+      () => {
+        timedOut = true
+        childProcess.kill()
+      },
+      4 * 60 * 1000
+    )
+
+    childProcess.on("error", (err: Error) => {
+      clearTimeout(timeout)
+      reject(err)
+    })
+
+    childProcess.stdout!.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString()
+      if (isDebugEnabled) {
+        process.stdout.write(chunk)
+      }
+    })
+
+    childProcess.stderr!.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString()
+      if (isDebugEnabled) {
+        process.stderr.write(chunk)
+      }
+    })
+
+    childProcess.stdin!.end(data)
+
+    childProcess.once("close", (code: number) => {
+      clearTimeout(timeout)
+      if (timedOut) {
+        reject(new Error(`${command} timed out after 4 minutes`))
+      } else if (code === 0) {
+        resolve({ stdout, stderr })
+      } else {
+        reject(new ExecError(command, code ?? -1, stdout, stderr))
+      }
+    })
+  })
+}
+
+export function spawn(command: string, args?: Array<string> | null, options?: SpawnOptions, extraOptions?: ExtraSpawnOptions): Promise<any> {
+  return new Promise<any>((resolve, reject) => {
+    handleProcess("close", doSpawn(command, args || [], options, extraOptions), command, resolve, reject)
+  })
+}
+
+function handleProcess(event: string, childProcess: ChildProcess, command: string, resolve: ((value?: any) => void) | null, reject: (reason?: any) => void) {
+  childProcess.on("error", reject)
+
+  let out = ""
+  if (childProcess.stdout != null) {
+    childProcess.stdout.on("data", (data: string) => {
+      out += data
+    })
+  }
+
+  let errorOut = ""
+  if (childProcess.stderr != null) {
+    childProcess.stderr.on("data", (data: string) => {
+      errorOut += data
+    })
+  }
+
+  childProcess.once(event, (code: number) => {
+    if (log.isDebugEnabled) {
+      const fields: any = {
+        command: path.basename(command),
+        code,
+        pid: childProcess.pid,
+      }
+      if (out.length > 0) {
+        fields.out = out
+      }
+      log.debug(fields, "exited")
+    }
+
+    if (code === 0) {
+      if (resolve != null) {
+        resolve(out)
+      }
+    } else {
+      reject(new ExecError(command, code, out, errorOut))
+    }
+  })
+}
+
+function formatOut(text: string, title: string) {
+  return text.length === 0 ? "" : `\n${title}:\n${text}`
+}
+
+export class ExecError extends Error {
+  alreadyLogged = false
+
+  static code = "ERR_ELECTRON_BUILDER_CANNOT_EXECUTE"
+
+  constructor(
+    command: string,
+    readonly exitCode: number,
+    out: string,
+    errorOut: string,
+    code = ExecError.code
+  ) {
+    super(`${command} process failed ${code}${formatOut(String(exitCode), "Exit code")}${formatOut(out, "Output")}${formatOut(errorOut, "Error output")}`)
+    ;(this as NodeJS.ErrnoException).code = code
+  }
+}
+
+export function use<T, R>(value: T | Nullish, task: (value: T) => R): R | null {
+  return value == null ? null : task(value)
+}
+
+export function isTokenCharValid(token: string) {
+  return /^[.\w/=+-]+$/.test(token)
+}
+
+export async function getUserDefinedCacheDir() {
+  let cacheEnv = process.env.ELECTRON_BUILDER_CACHE
+  if (!isEmptyOrSpaces(cacheEnv)) {
+    cacheEnv = path.resolve(cacheEnv)
+    if (!(await exists(cacheEnv))) {
+      await mkdir(cacheEnv)
+    }
+    return cacheEnv
+  }
+  return undefined
+}
+
+export function addValue<K, T>(map: Map<K, Array<T>>, key: K, value: T) {
+  const list = map.get(key)
+  if (list == null) {
+    map.set(key, [value])
+  } else if (!list.includes(value)) {
+    list.push(value)
+  }
+}
+
+export function isArrayEqualRegardlessOfSort(a: Array<string>, b: Array<string>) {
+  a = a.slice()
+  b = b.slice()
+  a.sort()
+  b.sort()
+  return a.length === b.length && a.every((value, index) => value === b[index])
+}
+
+/**
+ * Recursively removes all undefined and null values from an object
+ */
+export function removeNullish<T>(obj: T): T {
+  if (obj === null || typeof obj !== "object") {
+    return obj
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map(removeNullish) as T
+  }
+
+  const result: Record<string, any> = {}
+  for (const [key, value] of Object.entries(obj)) {
+    if (value != null) {
+      result[key] = removeNullish(value)
+    }
+  }
+  return result as T
+}
+
+export function replaceDefault(inList: Array<string> | Nullish, defaultList: Array<string>): Array<string> {
+  if (inList == null || (inList.length === 1 && inList[0] === "default")) {
+    return defaultList
+  }
+
+  const index = inList.indexOf("default")
+  if (index >= 0) {
+    const list = inList.slice(0, index)
+    list.push(...defaultList)
+    if (index !== inList.length - 1) {
+      list.push(...inList.slice(index + 1))
+    }
+    inList = list
+  }
+  return inList
+}
+
+export function getPlatformIconFileName(value: string | Nullish, isMac: boolean) {
+  if (value === undefined) {
+    return undefined
+  }
+  if (value === null) {
+    return null
+  }
+
+  if (!value.includes(".")) {
+    return `${value}.${isMac ? "icns" : "ico"}`
+  }
+
+  return value.replace(isMac ? ".ico" : ".icns", isMac ? ".icns" : ".ico")
+}
+
+export function isPullRequest() {
+  // TRAVIS_PULL_REQUEST is set to the pull request number if the current job is a pull request build, or false if it’s not.
+  function isSet(value: string | undefined) {
+    // value can be or null, or empty string
+    return value && value !== "false"
+  }
+
+  return (
+    isSet(process.env.TRAVIS_PULL_REQUEST) ||
+    isSet(process.env.CIRCLE_PULL_REQUEST) ||
+    isSet(process.env.BITRISE_PULL_REQUEST) ||
+    isSet(process.env.APPVEYOR_PULL_REQUEST_NUMBER) ||
+    isSet(process.env.GITHUB_BASE_REF)
+  )
+}
+
+export function isEnvTrue(value: string | Nullish) {
+  if (value != null) {
+    value = value.trim()
+  }
+  return value === "true" || value === "" || value === "1"
+}
+
+export class InvalidConfigurationError extends Error {
+  constructor(message: string, code = "ERR_ELECTRON_BUILDER_INVALID_CONFIGURATION") {
+    super(message)
+    ;(this as NodeJS.ErrnoException).code = code
+  }
+}
+
+/**
+ * Resolves a user-supplied path to an absolute form and validates it.
+ *
+ * Always rejects paths containing null bytes or newlines (C-level argument
+ * injection risk even with array-form execFile).
+ *
+ * When `base` is provided, also enforces containment: the resolved path must
+ * start with the resolved `base` directory.  This `startsWith`-based check is
+ * the pattern that CodeQL's path-injection analysis recognises as a sanitizer,
+ * clearing the taint on the returned value for interprocedural analysis.
+ */
+export function sanitizeDirPath(p: string, base?: string): string {
+  if (isEmptyOrSpaces(p)) {
+    throw new InvalidConfigurationError("Directory path must be a non-empty string")
+  }
+  if (p.includes("\0") || p.includes("\n") || p.includes("\r")) {
+    throw new InvalidConfigurationError(`Directory path contains illegal characters: "${p}"`)
+  }
+
+  const resolved = path.resolve(p)
+
+  if (base != null) {
+    const resolvedBase = path.resolve(base)
+    if (resolved !== resolvedBase && !resolved.startsWith(resolvedBase + path.sep)) {
+      throw new InvalidConfigurationError(`Path "${p}" must be within "${base}"`)
+    }
+  }
+  return resolved
+}
+
+/**
+ * Validates a path and returns the complete 7-Zip `-o<dir>` switch token.
+ *
+ * Input is first normalized via `sanitizeDirPath` (absolute resolution + null/newline
+ * rejection), then validated for 7za switch-token safety.
+ *
+ * Allowlist rejects:
+ *   - empty string (7za would receive bare `-o`, which fails)
+ *   - leading `-`  (7za would misparse the token as a new switch)
+ *   - control chars 0x00–0x1F and DEL 0x7F (C-level truncation/control risk)
+ */
+export function to7zaOutputSwitch(p: string): string {
+  const safePath = sanitizeDirPath(p)
+  // eslint-disable-next-line no-control-regex
+  if (!/^[^\x00-\x1F\x7F-][^\x00-\x1F\x7F]*$/.test(safePath)) {
+    throw new InvalidConfigurationError(`7za output path is empty, starts with "-", or contains control characters: "${p}"`)
+  }
+  return "-o" + safePath
+}
